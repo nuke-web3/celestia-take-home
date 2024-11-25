@@ -1,6 +1,6 @@
+use rand::Rng;
 use std::thread;
 use std::time::Duration;
-use rand::Rng;
 
 pub type Proof = Vec<u8>;
 

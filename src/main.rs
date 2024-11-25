@@ -1,12 +1,12 @@
-use sled;
 use lazy_static::lazy_static;
+use sled;
 
-use actix_web::{App, HttpServer, web, Responder, HttpResponse};
 use actix_files as fs;
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use celestia_types::{nmt::Namespace, Commitment};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::collections::{VecDeque, HashMap};
-use serde::{Serialize, Deserialize};
-use celestia_types::{Commitment, nmt::Namespace};
 // The real SP1SDK library is here
 //use sp1_sdk::SP1ProofWithPublicValues;
 // But we will use an educational mock instead, here:
@@ -15,6 +15,10 @@ use zkproofs::{generate_proof, Proof};
 
 use hex;
 
+// Startup a GLOBAL Database instance.
+// Note: `clone()` creates a cheap reference if reqired to [insert/get] from,
+// similar semantics to [`Arc<BTreeMap>`].
+// The data is (by default) is fsynced every 500 miliseconds.
 lazy_static! {
     static ref JOB_DB: sled::Db = sled::open("data/jobs").expect("DB open Error");
 }
@@ -25,7 +29,7 @@ struct Job {
     hash: Option<[u8; 32]>,
     height: u64,
     namespace: Namespace,
-    // commented out the Option<SP1ProofWithPublicValues> 
+    // commented out the Option<SP1ProofWithPublicValues>
     //replaced it with the mock educational version
     //result: Option<SP1ProofWithPublicValues>,
     result: Option<Proof>,
@@ -33,7 +37,7 @@ struct Job {
 }
 
 // Reuqired serde for convinince use in sled
-// Could remove serde round trip on DB with  fn
+// TODO: Could remove serde round trip on DB with <https://github.com/spacejam/sled/blob/main/examples/structured.rs>
 impl From<Job> for sled::IVec {
     fn from(item: Job) -> Self {
         let bytes = bincode::serialize(&item).expect("DB: Job Serialization failed");
@@ -62,8 +66,10 @@ pub struct BlobInfo {
     pub height: u64,
 }
 
-async fn add_job(data: web::Data<AppState>, query: web::Query<HashMap<String, String>>) -> impl Responder {
-    
+async fn add_job(
+    data: web::Data<AppState>,
+    query: web::Query<HashMap<String, String>>,
+) -> impl Responder {
     let height = match query.get("height").and_then(|h| h.parse::<u64>().ok()) {
         Some(h) => h,
         None => return HttpResponse::BadRequest().json("Invalid or missing height parameter"),
@@ -71,14 +77,19 @@ async fn add_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
     let namespace = match query.get("namespace").and_then(|ns| hex::decode(ns).ok()) {
         Some(ns) => match Namespace::new_v0(&ns) {
             Ok(namespace) => namespace,
-            Err(_) => return HttpResponse::BadRequest().json("Couldn't create v0 namespace from provided bytes"),
+            Err(_) => {
+                return HttpResponse::BadRequest()
+                    .json("Couldn't create v0 namespace from provided bytes")
+            }
         },
         _ => return HttpResponse::BadRequest().json("No namespace provided"),
     };
     let commitment = match query.get("commitment").and_then(|c| hex::decode(c).ok()) {
         Some(c) if c.len() == 32 => match c.try_into() {
             Ok(arr) => Commitment(arr),
-            Err(_) => return HttpResponse::BadRequest().json("Failed to convert commitment to array"),
+            Err(_) => {
+                return HttpResponse::BadRequest().json("Failed to convert commitment to array")
+            }
         },
         _ => return HttpResponse::BadRequest().json("Invalid commitment parameter"),
     };
@@ -86,7 +97,7 @@ async fn add_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
     // Check if we have a job for this commitment, if it exists, return the job
     let job_statuses = data.job_statuses.clone();
 
-    if let Ok(Some(raw_job))  = job_statuses.get(&commitment.0) {
+    if let Ok(Some(raw_job)) = job_statuses.get(&commitment.0) {
         return HttpResponse::Ok().json(format!("{raw_job:?}"));
     }
 
@@ -100,22 +111,31 @@ async fn add_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
         status: JobStatus::InQueue,
     };
     data.job_queue.lock().unwrap().push_back(job.clone());
-    job_statuses.insert(commitment.0, job.clone()).expect("DB: Insert Job Failed");
+    job_statuses
+        .insert(commitment.0, job.clone())
+        .expect("DB: Insert Job Failed");
     HttpResponse::Ok().json(job)
 }
 
-async fn get_job(data: web::Data<AppState>, query: web::Query<HashMap<String, String>>) -> impl Responder {
+async fn get_job(
+    data: web::Data<AppState>,
+    query: web::Query<HashMap<String, String>>,
+) -> impl Responder {
     println!("Getting job");
-    let commitment_hash: CommitmentHash = match query.get("commitment").and_then(|c| hex::decode(c).ok()) {
-        Some(c) if c.len() == 32 => c.try_into().unwrap(),
-        _ => return HttpResponse::BadRequest().json("Invalid commitment hash"),
-    };
+    let commitment_hash: CommitmentHash =
+        match query.get("commitment").and_then(|c| hex::decode(c).ok()) {
+            Some(c) if c.len() == 32 => c.try_into().unwrap(),
+            _ => return HttpResponse::BadRequest().json("Invalid commitment hash"),
+        };
 
     let job_statuses = data.job_statuses.clone();
     if let Ok(Some(job)) = job_statuses.get(&commitment_hash) {
         HttpResponse::Ok().json(format!("{job:?}"))
     } else {
-        HttpResponse::NotFound().json(format!("Job with commitment hash {} not found", hex::encode(commitment_hash)))
+        HttpResponse::NotFound().json(format!(
+            "Job with commitment hash {} not found",
+            hex::encode(commitment_hash)
+        ))
     }
 }
 
@@ -137,16 +157,16 @@ fn start_worker(app_state: web::Data<AppState>) {
                 println!("Job completed: {:?}", job);
 
                 let job_statuses = state.job_statuses.clone();
-                job_statuses.insert(job.commitment.0, job.clone()).expect("DB: Insert Job Failed");
+                job_statuses
+                    .insert(job.commitment.0, job.clone())
+                    .expect("DB: Insert Job Failed");
             }
         }
     });
 }
-    
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-
     let app_state = web::Data::new(AppState {
         job_queue: Arc::new(Mutex::new(VecDeque::new())),
         job_statuses: JOB_DB.clone(),
