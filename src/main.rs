@@ -5,8 +5,7 @@ use actix_files as fs;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use celestia_types::{nmt::Namespace, Commitment};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 // The real SP1SDK library is here
 //use sp1_sdk::SP1ProofWithPublicValues;
 // But we will use an educational mock instead, here:
@@ -16,11 +15,11 @@ use zkproofs::{generate_proof, Proof};
 use hex;
 
 // Startup a GLOBAL Database instance.
-// Note: `clone()` creates a cheap reference if reqired to [insert/get] from,
 // similar semantics to [`Arc<BTreeMap>`].
 // The data is (by default) is fsynced every 500 miliseconds.
 lazy_static! {
     static ref JOB_DB: sled::Db = sled::open("data/jobs").expect("DB open Error");
+    static ref JOB_Q: sled::Db = sled::open("data/queue").expect("DB open Error");
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,8 +61,8 @@ enum JobStatus {
 type CommitmentHash = [u8; 32];
 
 pub struct AppState {
-    job_queue: Arc<Mutex<VecDeque<Job>>>,
-    job_statuses: sled::Db,
+    job_queue: sled::Db,
+    jobs_db: sled::Db,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,10 +99,7 @@ async fn add_job(
         _ => return HttpResponse::BadRequest().json("Invalid commitment parameter"),
     };
 
-    // Check if we have a job for this commitment, if it exists, return the job
-    let job_statuses = data.job_statuses.clone();
-
-    if let Ok(Some(raw_job)) = job_statuses.get(&commitment.0) {
+    if let Ok(Some(raw_job)) = data.jobs_db.get(&commitment.0) {
         let job: Job = raw_job.into();
         return HttpResponse::Ok().json(job);
     }
@@ -117,10 +113,15 @@ async fn add_job(
         result: None,
         status: JobStatus::InQueue,
     };
-    data.job_queue.lock().unwrap().push_back(job.clone());
-    job_statuses
+
+    data.job_queue
+        .insert(job.commitment.0, vec![])
+        .expect("DB: Queue Write Error");
+
+    data.jobs_db
         .insert(commitment.0, job.clone())
-        .expect("DB: Insert Job Failed");
+        .expect("DB: Job Write Error");
+
     HttpResponse::Ok().json(job)
 }
 
@@ -135,8 +136,8 @@ async fn get_job(
             _ => return HttpResponse::BadRequest().json("Invalid commitment hash"),
         };
 
-    let job_statuses = data.job_statuses.clone();
-    if let Ok(Some(raw_job)) = job_statuses.get(&commitment_hash) {
+    let jobs_db = data.jobs_db.clone();
+    if let Ok(Some(raw_job)) = jobs_db.get(&commitment_hash) {
         let job: Job = raw_job.into();
         HttpResponse::Ok().json(job)
     } else {
@@ -152,22 +153,27 @@ fn start_worker(app_state: web::Data<AppState>) {
     let state = app_state.clone();
     std::thread::spawn(move || {
         loop {
-            let job = {
-                let mut queue = state.job_queue.lock().unwrap();
-                queue.pop_front()
-            };
-            // Simulate a job being processed by sleeping, then updating the job status
-            if let Some(mut job) = job {
-                println!("Processing job: {:?}", job);
-                let proof: Proof = generate_proof();
-                job.status = JobStatus::Completed;
-                job.result = Some(proof);
-                println!("Job completed: {:?}", job);
+            if let Some(job_id) = state.job_queue.first().expect("DB: Queue Read Error") {
+                let maybe_raw_job = state.jobs_db.get(&job_id.0).expect("DB: Job Read Error");
 
-                let job_statuses = state.job_statuses.clone();
-                job_statuses
-                    .insert(job.commitment.0, job.clone())
-                    .expect("DB: Insert Job Failed");
+                // Simulate a job being processed by sleeping, then updating the job status
+                if let Some(raw_job) = maybe_raw_job {
+                    let mut job: Job = raw_job.into();
+                    println!("Processing job: {:?}", job);
+                    let proof: Proof = generate_proof();
+                    job.status = JobStatus::Completed;
+                    job.result = Some(proof);
+                    println!("Job completed: {:?}", job);
+
+                    state
+                        .jobs_db
+                        .insert(job.commitment.0, job.clone())
+                        .expect("DB: Insert Job Failed");
+                    state
+                        .job_queue
+                        .remove(job.commitment.0)
+                        .expect("DB: Queue Remove Error");
+                }
             }
         }
     });
@@ -176,8 +182,8 @@ fn start_worker(app_state: web::Data<AppState>) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(AppState {
-        job_queue: Arc::new(Mutex::new(VecDeque::new())),
-        job_statuses: JOB_DB.clone(),
+        job_queue: JOB_Q.clone(),
+        jobs_db: JOB_DB.clone(),
     });
 
     start_worker(app_state.clone());
