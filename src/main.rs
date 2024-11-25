@@ -63,7 +63,7 @@ type CommitmentHash = [u8; 32];
 
 pub struct AppState {
     job_queue: Arc<Mutex<VecDeque<Job>>>,
-    job_statuses: sled::Db,
+    jobs_db: sled::Db,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +101,7 @@ async fn add_job(
     };
 
     // Check if we have a job for this commitment, if it exists, return the job
-    let job_statuses = data.job_statuses.clone();
+    let job_statuses = data.jobs_db.clone();
 
     if let Ok(Some(raw_job)) = job_statuses.get(&commitment.0) {
         let job: Job = raw_job.into();
@@ -117,10 +117,23 @@ async fn add_job(
         result: None,
         status: JobStatus::InQueue,
     };
-    data.job_queue.lock().unwrap().push_back(job.clone());
+
+    let jq_bytes;
+    {
+        // Scope to hold lock as short as possible
+        let mut jq = data.job_queue.lock().unwrap();
+        jq.push_back(job.clone());
+        jq_bytes = bincode::serialize(&*jq).expect("Cannot serialize job queue");
+    }
+
+    // Atomically add the job to the queue and DB
+    let mut batch = sled::Batch::default();
+    batch.insert("JOB_QUEUE", jq_bytes);
+    batch.insert(commitment.0.as_slice(), job.clone());
     job_statuses
-        .insert(commitment.0, job.clone())
+        .apply_batch(batch)
         .expect("DB: Insert Job Failed");
+
     HttpResponse::Ok().json(job)
 }
 
@@ -135,8 +148,8 @@ async fn get_job(
             _ => return HttpResponse::BadRequest().json("Invalid commitment hash"),
         };
 
-    let job_statuses = data.job_statuses.clone();
-    if let Ok(Some(raw_job)) = job_statuses.get(&commitment_hash) {
+    let jobs_db = data.jobs_db.clone();
+    if let Ok(Some(raw_job)) = jobs_db.get(&commitment_hash) {
         let job: Job = raw_job.into();
         HttpResponse::Ok().json(job)
     } else {
@@ -152,10 +165,14 @@ fn start_worker(app_state: web::Data<AppState>) {
     let state = app_state.clone();
     std::thread::spawn(move || {
         loop {
-            let job = {
-                let mut queue = state.job_queue.lock().unwrap();
-                queue.pop_front()
-            };
+            let job;
+            let jq_bytes;
+            {
+                // Scope to hold lock as short as possible
+                let mut jq = state.job_queue.lock().unwrap();
+                job = jq.pop_front();
+                jq_bytes = bincode::serialize(&*jq).expect("Cannot serialize job queue");
+            }
             // Simulate a job being processed by sleeping, then updating the job status
             if let Some(mut job) = job {
                 println!("Processing job: {:?}", job);
@@ -164,10 +181,12 @@ fn start_worker(app_state: web::Data<AppState>) {
                 job.result = Some(proof);
                 println!("Job completed: {:?}", job);
 
-                let job_statuses = state.job_statuses.clone();
-                job_statuses
-                    .insert(job.commitment.0, job.clone())
-                    .expect("DB: Insert Job Failed");
+                // Atomically add the job to the queue and DB
+                let jobs_db = state.jobs_db.clone();
+                let mut batch = sled::Batch::default();
+                batch.insert("JOB_QUEUE", jq_bytes);
+                batch.insert(job.commitment.0.as_slice(), job.clone());
+                jobs_db.apply_batch(batch).expect("DB: Insert Job Failed");
             }
         }
     });
@@ -175,9 +194,17 @@ fn start_worker(app_state: web::Data<AppState>) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Recover Job Queue if unfinished jobs existed in DB before startup
+    let jq: VecDeque<Job>;
+    if let Some(db_job_queue) = JOB_DB.get("JOB_QUEUE").expect("DB Init: Cannot read") {
+        jq = bincode::deserialize(&db_job_queue).expect("Cannot serialize job queue");
+    } else {
+        jq = VecDeque::new();
+    }
+
     let app_state = web::Data::new(AppState {
-        job_queue: Arc::new(Mutex::new(VecDeque::new())),
-        job_statuses: JOB_DB.clone(),
+        job_queue: Arc::new(Mutex::new(jq)),
+        jobs_db: JOB_DB.clone(),
     });
 
     start_worker(app_state.clone());
