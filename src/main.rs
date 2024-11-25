@@ -45,6 +45,12 @@ impl From<Job> for sled::IVec {
     }
 }
 
+impl Into<Job> for sled::IVec {
+    fn into(self) -> Job {
+        bincode::deserialize(&self).expect("DB: Job Deserialization failed")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum JobStatus {
     InQueue,
@@ -98,7 +104,8 @@ async fn add_job(
     let job_statuses = data.job_statuses.clone();
 
     if let Ok(Some(raw_job)) = job_statuses.get(&commitment.0) {
-        return HttpResponse::Ok().json(format!("{raw_job:?}"));
+        let job: Job = raw_job.into();
+        return HttpResponse::Ok().json(job);
     }
 
     // Otherwise, create a job and add it to the back of the queue
@@ -129,8 +136,9 @@ async fn get_job(
         };
 
     let job_statuses = data.job_statuses.clone();
-    if let Ok(Some(job)) = job_statuses.get(&commitment_hash) {
-        HttpResponse::Ok().json(format!("{job:?}"))
+    if let Ok(Some(raw_job)) = job_statuses.get(&commitment_hash) {
+        let job: Job = raw_job.into();
+        HttpResponse::Ok().json(job)
     } else {
         HttpResponse::NotFound().json(format!(
             "Job with commitment hash {} not found",
