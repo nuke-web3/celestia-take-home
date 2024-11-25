@@ -1,7 +1,8 @@
-#![feature(async_closure)]
+use sled;
+use lazy_static::lazy_static;
+
 use actix_web::{App, HttpServer, web, Responder, HttpResponse};
 use actix_files as fs;
-use std::thread;
 use std::sync::{Arc, Mutex};
 use std::collections::{VecDeque, HashMap};
 use serde::{Serialize, Deserialize};
@@ -13,6 +14,10 @@ mod zkproofs;
 use zkproofs::{generate_proof, Proof};
 
 use hex;
+
+lazy_static! {
+    static ref JOB_DB: sled::Db = sled::open("data/jobs").expect("DB open Error");
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Job {
@@ -27,6 +32,15 @@ struct Job {
     status: JobStatus,
 }
 
+// Reuqired serde for convinince use in sled
+// Could remove serde round trip on DB with  fn
+impl From<Job> for sled::IVec {
+    fn from(item: Job) -> Self {
+        let bytes = bincode::serialize(&item).expect("DB: Job Serialization failed");
+        sled::IVec::from(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum JobStatus {
     InQueue,
@@ -39,7 +53,7 @@ type CommitmentHash = [u8; 32];
 
 pub struct AppState {
     job_queue: Arc<Mutex<VecDeque<Job>>>,
-    job_statuses: Arc<Mutex<HashMap<CommitmentHash, Job>>>,
+    job_statuses: sled::Db,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,9 +84,10 @@ async fn add_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
     };
 
     // Check if we have a job for this commitment, if it exists, return the job
-    let mut job_statuses = data.job_statuses.lock().unwrap();
-    if job_statuses.contains_key(&commitment.0) {
-        return HttpResponse::Ok().json(job_statuses[&commitment.0].clone());
+    let job_statuses = data.job_statuses.clone();
+
+    if let Ok(Some(raw_job))  = job_statuses.get(&commitment.0) {
+        return HttpResponse::Ok().json(format!("{raw_job:?}"));
     }
 
     // Otherwise, create a job and add it to the back of the queue
@@ -85,7 +100,7 @@ async fn add_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
         status: JobStatus::InQueue,
     };
     data.job_queue.lock().unwrap().push_back(job.clone());
-    job_statuses.insert(commitment.0, job.clone());
+    job_statuses.insert(commitment.0, job.clone()).expect("DB: Insert Job Failed");
     HttpResponse::Ok().json(job)
 }
 
@@ -96,9 +111,9 @@ async fn get_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
         _ => return HttpResponse::BadRequest().json("Invalid commitment hash"),
     };
 
-    let job_statuses = data.job_statuses.lock().unwrap();
-    if let Some(job) = job_statuses.get(&commitment_hash) {
-        HttpResponse::Ok().json(job)
+    let job_statuses = data.job_statuses.clone();
+    if let Ok(Some(job)) = job_statuses.get(&commitment_hash) {
+        HttpResponse::Ok().json(format!("{job:?}"))
     } else {
         HttpResponse::NotFound().json(format!("Job with commitment hash {} not found", hex::encode(commitment_hash)))
     }
@@ -107,7 +122,7 @@ async fn get_job(data: web::Data<AppState>, query: web::Query<HashMap<String, St
 fn start_worker(app_state: web::Data<AppState>) {
     println!("Starting worker");
     let state = app_state.clone();
-    thread::spawn(move || {
+    std::thread::spawn(move || {
         loop {
             let job = {
                 let mut queue = state.job_queue.lock().unwrap();
@@ -121,8 +136,8 @@ fn start_worker(app_state: web::Data<AppState>) {
                 job.result = Some(proof);
                 println!("Job completed: {:?}", job);
 
-                let mut job_statuses = state.job_statuses.lock().unwrap();
-                job_statuses.insert(job.commitment.0, job.clone());
+                let job_statuses = state.job_statuses.clone();
+                job_statuses.insert(job.commitment.0, job.clone()).expect("DB: Insert Job Failed");
             }
         }
     });
@@ -134,7 +149,7 @@ async fn main() -> std::io::Result<()> {
 
     let app_state = web::Data::new(AppState {
         job_queue: Arc::new(Mutex::new(VecDeque::new())),
-        job_statuses: Arc::new(Mutex::new(HashMap::new())),
+        job_statuses: JOB_DB.clone(),
     });
 
     start_worker(app_state.clone());
